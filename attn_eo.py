@@ -109,7 +109,11 @@ class EpisodicMemory:
             self.size = min(self.capacity, self.size + B)
 
     def query(
-        self, queries: torch.Tensor, topk: Optional[int] = None, temperature: float = 0.25
+        self,
+        queries: torch.Tensor,
+        topk: Optional[int] = None,
+        temperature: float = 0.25,
+        differentiable: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         B = queries.shape[0]
         if self.size == 0:
@@ -122,17 +126,17 @@ class EpisodicMemory:
         V = self.values[:self.size] # raw (Δμ space)
         scores = qn @ K.t() / max(1e-6, temperature)
 
-        if topk is not None and topk < self.size:
+        if differentiable or topk is None or topk >= self.size:
+            w = F.softmax(scores, dim=1)
+            retrieved = w @ V
+            return retrieved, w, None
+        else:
             topv, topidx = torch.topk(scores, topk, dim=1)
             topv_exp = torch.exp(topv - topv.max(dim=1, keepdim=True)[0])
             topw = topv_exp / (topv_exp.sum(dim=1, keepdim=True) + self.eps)
             vals = V[topidx]  # (B, topk, val_dim)
             retrieved = (topw.unsqueeze(-1) * vals).sum(dim=1)
             return retrieved, topw, topidx
-        else:
-            w = F.softmax(scores, dim=1)
-            retrieved = w @ V
-            return retrieved, w, None
 
 
 # -------------------------
@@ -278,63 +282,79 @@ class ErrorOptimizationPCN(nn.Module):
         temperature: float = 0.25,
         retrieval_strength_internal: float = 0.4,
         retrieval_strength_final: float = 1.0,
+        differentiable_query: bool = False,
     ):
         """
-        EO loop (no_grad) over μ, then top-layer final refine (with grad) + decode.
+        EO loop over μ, then top-layer final refine + decode.
         Memory contributes Δμ proposals (state deltas) *after* EO update each iteration.
+        If ``differentiable_query`` is True, memory retrieval uses a softmax over all
+        stored items so gradients can flow to the query representations. Otherwise a
+        hard top-k lookup is used.
         """
         x = x.to(self.device)
         μs_init = self.bottom_up_initial_states(x)
-        μs = [μ.detach().clone() for μ in μs_init]
+        μs = [μ.clone() for μ in μs_init]
 
-        # ----- EO iterations (no_grad) -----
-        with torch.no_grad():
-            for _ in range(self.inference_steps):
-                # Compute prediction errors at each layer
-                errs = []
-                for l in range(self.L - 1):
-                    pred = self.activation(self.dec_layers[l](μs[l + 1]))
-                    errs.append(μs[l] - pred)
+        # ----- EO iterations (with grad for gating nets) -----
+        for _ in range(self.inference_steps):
+            # Compute prediction errors at each layer
+            errs = []
+            for l in range(self.L - 1):
+                pred = self.activation(self.dec_layers[l](μs[l + 1]))
+                errs.append(μs[l] - pred)
 
-                # EO update + Δμ proposals
-                for l in range(self.L - 1):
-                    error = errs[l]  # (B, dim_l)
+            # EO update + Δμ proposals
+            for l in range(self.L - 1):
+                error = errs[l]  # (B, dim_l)
 
-                    # activation derivative
-                    dec_out = self.dec_layers[l](μs[l + 1])
-                    if hasattr(self.activation, "__name__") and "relu" in self.activation.__name__:
-                        act_deriv = (dec_out > 0).float()
-                    else:
-                        act_deriv = torch.ones_like(dec_out)
+                # activation derivative
+                dec_out = self.dec_layers[l](μs[l + 1])
+                if hasattr(self.activation, "__name__") and "relu" in self.activation.__name__:
+                    act_deriv = (dec_out > 0).float()
+                else:
+                    act_deriv = torch.ones_like(dec_out)
 
-                    # ✅ correct descent direction:
-                    # dL/dμ_{l+1} = - W^T( φ'(W μ_{l+1}) ⊙ e_l )
-                    error_grad = (error * act_deriv)                         # (B, dim_l)
-                    weight_grad = error_grad @ self.dec_layers[l].weight     # (B, dim_{l+1})
+                # ✅ correct descent direction:
+                # dL/dμ_{l+1} = - W^T( φ'(W μ_{l+1}) ⊙ e_l )
+                error_grad = (error * act_deriv)                         # (B, dim_l)
+                weight_grad = error_grad @ self.dec_layers[l].weight     # (B, dim_{l+1})
 
-                    gain = float(self.gains[l].item())
-                    eo_update = self.error_lr * (gain * weight_grad - self.damping * μs[l + 1])
-                    μs[l + 1] = μs[l + 1] + eo_update  # out-of-place style update
+                gain = float(self.gains[l].item())
+                eo_update = self.error_lr * (gain * weight_grad - self.damping * μs[l + 1])
+                μs[l + 1] = μs[l + 1] + eo_update  # out-of-place style update
 
-                    # Δμ proposal from memory (gated)
-                    if use_memory and (dmm is not None) and (l in dmm.memories) and dmm.memories[l].size > 0:
+                # Δμ proposal from memory (gated)
+                if use_memory and (dmm is not None) and (l in dmm.memories) and dmm.memories[l].size > 0:
+                    if differentiable_query:
                         context = torch.cat([μs[l], μs[l + 1]], dim=-1)
-                        delta_mu_prop, _, _ = dmm.memories[l].query(context, topk=topk, temperature=temperature)
-                        gate_logits = self.gate_nets[l](μs[l + 1])
-                        gate = torch.sigmoid(gate_logits).mean(dim=-1, keepdim=True)  # scalar per sample
-                        μs[l + 1] = μs[l + 1] + retrieval_strength_internal * gate * delta_mu_prop
+                    else:
+                        context = torch.cat([μs[l].detach(), μs[l + 1].detach()], dim=-1)
+                    delta_mu_prop, _, _ = dmm.memories[l].query(
+                        context, topk=topk, temperature=temperature, differentiable=differentiable_query
+                    )
+                    if not differentiable_query:
+                        delta_mu_prop = delta_mu_prop.detach()
+                    gate_logits = self.gate_nets[l](μs[l + 1])
+                    gate = torch.sigmoid(gate_logits).mean(dim=-1, keepdim=True)  # scalar per sample
+                    μs[l + 1] = μs[l + 1] + retrieval_strength_internal * gate * delta_mu_prop
 
-                    μs[l + 1] = self.mu_norms[l + 1](μs[l + 1])
+                μs[l + 1] = self.mu_norms[l + 1](μs[l + 1])
 
-        μs_final = [m.detach().clone() for m in μs]
+        μs_final = [m.clone() for m in μs]
 
-        # ----- top-layer final refine (learned gate, with grad) -----
-        μ_top_for_refine = μs_final[-1].clone().requires_grad_(True)
+        # ----- top-layer final refine (learned gate) -----
+        μ_top_for_refine = μs_final[-1]
         μ_refined_top = μ_top_for_refine
         if use_memory and (dmm is not None) and ((self.L - 2) in dmm.memories) and dmm.memories[self.L - 2].size > 0:
-            # context uses μ_{L-2} from the no-grad run (detached) + current μ_top_for_refine (with grad)
-            context_top = torch.cat([μs_final[-2], μ_top_for_refine], dim=-1)
-            delta_mu_top, _, _ = dmm.memories[self.L - 2].query(context_top, topk=topk, temperature=temperature)
+            if differentiable_query:
+                context_top = torch.cat([μs_final[-2], μ_top_for_refine], dim=-1)
+            else:
+                context_top = torch.cat([μs_final[-2].detach(), μ_top_for_refine], dim=-1)
+            delta_mu_top, _, _ = dmm.memories[self.L - 2].query(
+                context_top, topk=topk, temperature=temperature, differentiable=differentiable_query
+            )
+            if not differentiable_query:
+                delta_mu_top = delta_mu_top.detach()
             gate_logits = self.gate_nets[-1](μ_top_for_refine)
             gate = torch.sigmoid(gate_logits).mean(dim=-1, keepdim=True)
             μ_refined_top = μ_top_for_refine + retrieval_strength_final * gate * delta_mu_top
@@ -423,36 +443,39 @@ def train_epoch(
 
         # 1) Populate memory (no memory used here)
         with torch.no_grad():
-            # fewer steps to save time
+            orig_steps = model.inference_steps
+            model.inference_steps = inf_steps_pop
             res_pop = model.infer(
                 x, dmm=None, use_memory=False,
                 topk=topk, temperature=temperature,
                 retrieval_strength_internal=retrieval_strength_internal,
                 retrieval_strength_final=retrieval_strength_final,
             )
+            model.inference_steps = orig_steps
             _, _, μs_init, μs_final, _ = res_pop[:5]
             dmm.insert_from_runs(μs_init, μs_final)
 
         # 2) Train with memory
+        orig_steps = model.inference_steps
+        model.inference_steps = inf_steps_train
         x_hat_final, x_hat_init, _, _, _, logits_init, logits_final = model.infer(
             x, dmm=dmm, use_memory=True,
             topk=topk, temperature=temperature,
             retrieval_strength_internal=retrieval_strength_internal,
             retrieval_strength_final=retrieval_strength_final,
+            differentiable_query=True,
         )
+        model.inference_steps = orig_steps
         loss_recon_final = F.mse_loss(x_hat_final, x)
         loss_recon_init = F.mse_loss(x_hat_init, x)
 
         loss = 0.5 * loss_recon_final + lambda_init * 0.5 * loss_recon_init
 
-        if model.use_classification:
-            if logits_init is not None:
-                loss += lambda_class * F.cross_entropy(logits_init, y)
-            if logits_final is not None:
-                loss += lambda_class * F.cross_entropy(logits_final, y)
-                with torch.no_grad():
-                    pred = torch.argmax(logits_final, dim=1)
-                    total_acc += (pred == y).float().mean().item()
+        if model.use_classification and logits_final is not None:
+            loss += lambda_class * F.cross_entropy(logits_final, y)
+            with torch.no_grad():
+                pred = torch.argmax(logits_final, dim=1)
+                total_acc += (pred == y).float().mean().item()
 
         opt.zero_grad()
         loss.backward()
