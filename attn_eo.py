@@ -114,29 +114,40 @@ class EpisodicMemory:
         topk: Optional[int] = None,
         temperature: float = 0.25,
         differentiable: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        """Retrieve values and similarity statistics for ``queries``.
+
+        Returns a tuple ``(retrieved, weights, indices, max_sim)`` where ``max_sim``
+        is the maximum cosine similarity between each query and any stored key.
+        ``max_sim`` is used as an attentional confidence signal by the caller.
+        """
+
         B = queries.shape[0]
         if self.size == 0:
-            return torch.zeros((B, self.val_dim), device=self.device), torch.zeros((B, 0), device=self.device), None
+            zero_val = torch.zeros((B, self.val_dim), device=self.device)
+            zero_w = torch.zeros((B, 0), device=self.device)
+            return zero_val, zero_w, None, torch.zeros(B, device=self.device)
 
         q = queries.to(self.device)
         qn = q / (q.norm(dim=1, keepdim=True).clamp_min(self.eps))
 
         K = self.keys[:self.size]   # normalized
         V = self.values[:self.size] # raw (Δμ space)
-        scores = qn @ K.t() / max(1e-6, temperature)
+        raw_scores = qn @ K.t()     # cosine similarity
+        max_sim, _ = raw_scores.max(dim=1)
+        scores = raw_scores / max(1e-6, temperature)
 
         if differentiable or topk is None or topk >= self.size:
             w = F.softmax(scores, dim=1)
             retrieved = w @ V
-            return retrieved, w, None
+            return retrieved, w, None, max_sim
         else:
             topv, topidx = torch.topk(scores, topk, dim=1)
             topv_exp = torch.exp(topv - topv.max(dim=1, keepdim=True)[0])
             topw = topv_exp / (topv_exp.sum(dim=1, keepdim=True) + self.eps)
             vals = V[topidx]  # (B, topk, val_dim)
             retrieved = (topw.unsqueeze(-1) * vals).sum(dim=1)
-            return retrieved, topw, topidx
+            return retrieved, topw, topidx, max_sim
 
 
 # -------------------------
@@ -329,14 +340,15 @@ class ErrorOptimizationPCN(nn.Module):
                         context = torch.cat([μs[l], μs[l + 1]], dim=-1)
                     else:
                         context = torch.cat([μs[l].detach(), μs[l + 1].detach()], dim=-1)
-                    delta_mu_prop, _, _ = dmm.memories[l].query(
+                    delta_mu_prop, _, _, sim = dmm.memories[l].query(
                         context, topk=topk, temperature=temperature, differentiable=differentiable_query
                     )
                     if not differentiable_query:
                         delta_mu_prop = delta_mu_prop.detach()
+                    sim_strength = ((sim + 1) / 2).unsqueeze(-1)  # map cos[-1,1] -> [0,1]
                     gate_logits = self.gate_nets[l](μs[l + 1])
                     gate = torch.sigmoid(gate_logits).mean(dim=-1, keepdim=True)  # scalar per sample
-                    μs[l + 1] = μs[l + 1] + retrieval_strength_internal * gate * delta_mu_prop
+                    μs[l + 1] = μs[l + 1] + retrieval_strength_internal * gate * sim_strength * delta_mu_prop
 
                 μs[l + 1] = self.mu_norms[l + 1](μs[l + 1])
 
@@ -350,14 +362,15 @@ class ErrorOptimizationPCN(nn.Module):
                 context_top = torch.cat([μs_final[-2], μ_top_for_refine], dim=-1)
             else:
                 context_top = torch.cat([μs_final[-2].detach(), μ_top_for_refine], dim=-1)
-            delta_mu_top, _, _ = dmm.memories[self.L - 2].query(
+            delta_mu_top, _, _, sim = dmm.memories[self.L - 2].query(
                 context_top, topk=topk, temperature=temperature, differentiable=differentiable_query
             )
             if not differentiable_query:
                 delta_mu_top = delta_mu_top.detach()
+            sim_strength = ((sim + 1) / 2).unsqueeze(-1)
             gate_logits = self.gate_nets[-1](μ_top_for_refine)
             gate = torch.sigmoid(gate_logits).mean(dim=-1, keepdim=True)
-            μ_refined_top = μ_top_for_refine + retrieval_strength_final * gate * delta_mu_top
+            μ_refined_top = μ_top_for_refine + retrieval_strength_final * gate * sim_strength * delta_mu_top
 
         # Decode from both initial μ and refined μ for losses
         x_hat_init = self.decode_from_top(μs_init[-1])
